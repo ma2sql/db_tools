@@ -1,3 +1,5 @@
+#!/usr/bin/python
+
 from __future__ import print_function
 
 from datetime import datetime
@@ -34,37 +36,37 @@ def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def get_cmd_stats(host, port, r, cmd, ignore_cmd):
-    stats = {}
-    total = []
-    etc = []
+def get_cmd_stats_clojure(host, port, password, cmd, ignore_cmd):
+    r = StrictRedis(host, port, password=password)
 
-    for c in cmd:
-        stats[c] = 0
+    def extract_key_value(key_value):
+        (k, v) = (key_value)
+        return (k.replace('cmdstat_', '').upper(), v['calls'])
 
-    try:
-        stats_raw = r.info('commandstats')
-        for k, v in stats_raw.items():
-            k = k.replace('cmdstat_', '').upper()
-            total.append(v['calls'])
+    def is_command(key_value):
+        (k, v) = (key_value)
+        return k in cmd or (k not in ignore_cmd and cmd == [])
 
-            if k in cmd:
-                stats[k] = v['calls']
-            elif k not in ignore_cmd and cmd == []:
-                stats[k] = v['calls']
-            else:
-                etc.append(v['calls'])
+    def is_not_command(key_value):
+        return not is_command(key_value)
+        
 
-        stats[CMD_ETC] = sum(etc)
-        stats[CMD_TOTAL] = sum(total)
+    def get_cmd_stats():
+        stats = {}
+        try:
+            stats_raw = dict(map(extract_key_value, r.info('commandstats').items()))
+            stats.update(dict(filter(is_command, stats_raw.items())))
+            stats[CMD_ETC] = sum(map(itemgetter(1), filter(is_not_command, stats_raw.items())))
+            stats[CMD_TOTAL] = sum(stats_raw.values())
+        except RedisError as e:
+            raise e
+    
+        except KeyboardInterrupt as e:
+            pass
+    
+        return stats
 
-    except RedisError as e:
-        raise e
-
-    except KeyboardInterrupt as e:
-        pass
-
-    return stats
+    return get_cmd_stats
 
 
 def get_cluster_master_nodes(host, port):
@@ -89,13 +91,14 @@ def main(nodes, password, cmd, ignore_cmd):
 
     signal(SIGINT, signal_handler)
 
-    RedisConn = namedtuple('RedisConn', 'host port r')
-    redis_conns = []
+    # RedisConn = namedtuple('RedisConn', 'host port r')
+    # redis_conns = []
+    redis_stats_funcs = []
 
     try:
         for i, node in enumerate(nodes):
             (host, port) = node
-            redis_conns.append(RedisConn(host=host, port=port, r=StrictRedis(host, port, password=password)))
+            redis_stats_funcs.append(get_cmd_stats_clojure(host, port, password, cmd, ignore_cmd))
 
         pre_stats = defaultdict(lambda: 0)
 
@@ -109,8 +112,7 @@ def main(nodes, password, cmd, ignore_cmd):
             stats = defaultdict(lambda: 0)
 
             executor = ThreadPoolExecutor(max_workers=8)
-            threads = [executor.submit(get_cmd_stats, conn.host, conn.port, conn.r, cmd, ignore_cmd)
-                       for conn in redis_conns]
+            threads = map(executor.submit, redis_stats_funcs)
 
             for t in as_completed(threads):
                 if not t.result() == {}:
@@ -139,11 +141,6 @@ def main(nodes, password, cmd, ignore_cmd):
 
     except RedisError as e:
         print('RedisError:', e)
-
-    finally:
-        for conn in redis_conns:
-            r = conn.r
-            del r
 
 
 if __name__ == '__main__':
