@@ -11,6 +11,7 @@ from redis import StrictRedis, RedisError
 from collections import namedtuple, defaultdict
 from operator import itemgetter
 from signal import signal, SIGINT
+from functools import reduce
 
 from argparse import ArgumentParser
 
@@ -40,30 +41,33 @@ def get_cmd_stats_clojure(host, port, password, cmd, ignore_cmd):
     r = StrictRedis(host, port, password=password)
 
     def extract_key_value(key_value):
-        (k, v) = (key_value)
+        (k, v) = key_value
         return (k.replace('cmdstat_', '').upper(), v['calls'])
 
-    def is_command(key_value):
-        (k, v) = (key_value)
+    def is_command(k):
         return k in cmd or (k not in ignore_cmd and cmd == [])
 
-    def is_not_command(key_value):
-        return not is_command(key_value)
-        
+    def stats_summary(stats, key_value):
+        (k, v) = key_value
+        if is_command(k):
+            stats[k] = v
+        else:
+            stats[CMD_ETC] = stats[CMD_ETC] + v
+
+        stats[CMD_TOTAL] = stats[CMD_TOTAL] + v
+
+        return stats
 
     def get_cmd_stats():
         stats = {}
         try:
             stats_raw = dict(map(extract_key_value, r.info('commandstats').items()))
-            stats.update(dict(filter(is_command, stats_raw.items())))
-            stats[CMD_ETC] = sum(map(itemgetter(1), filter(is_not_command, stats_raw.items())))
-            stats[CMD_TOTAL] = sum(stats_raw.values())
+            stats = reduce(stats_summary, stats_raw.items(), {CMD_ETC:0, CMD_TOTAL: 0})
         except RedisError as e:
             raise e
-    
         except KeyboardInterrupt as e:
             pass
-    
+
         return stats
 
     return get_cmd_stats
