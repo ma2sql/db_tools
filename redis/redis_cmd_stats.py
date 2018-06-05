@@ -37,7 +37,7 @@ def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def get_cmd_stats_clojure(host, port, password, cmd, ignore_cmd):
+def get_cmd_stats_closure(host, port, password, cmd, ignore_cmd):
     r = StrictRedis(host, port, password=password)
 
     def extract_key_value(key_value):
@@ -102,7 +102,7 @@ def main(nodes, password, cmd, ignore_cmd):
     try:
         for i, node in enumerate(nodes):
             (host, port) = node
-            redis_stats_funcs.append(get_cmd_stats_clojure(host, port, password, cmd, ignore_cmd))
+            redis_stats_funcs.append(get_cmd_stats_closure(host, port, password, cmd, ignore_cmd))
 
         pre_stats = defaultdict(lambda: 0)
 
