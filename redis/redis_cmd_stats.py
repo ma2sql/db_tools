@@ -77,7 +77,7 @@ def get_cluster_master_nodes(host, port):
     nodes = []
     try:
         r = StrictRedis(host=host, port=port)
-        nodes = [k.split(':') for k, v in sorted(r.cluster('nodes').items(), key=itemgetter(0))
+        nodes = [k.replace('@',':').split(':')[:2] for k, v in sorted(r.cluster('nodes').items(), key=itemgetter(0))
                  if v['flags'] in ('master', 'myself,master')]
     except RedisError as e:
         print('Redis Error: ', e)
