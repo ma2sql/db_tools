@@ -1,105 +1,214 @@
-from redis import StrictRedis 
-from sys import argv
-from random import randrange, random
-from hashlib import md5
-from functools import wraps
-from time import time
+#!/usr/bin/python
+
+from __future__ import print_function
+
+from datetime import datetime
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from time import sleep
+
+from redis import StrictRedis, RedisError
+from collections import namedtuple, defaultdict
+from operator import itemgetter
+from signal import signal, SIGINT
+from functools import reduce
+
 from argparse import ArgumentParser
 
-DEFAULT_INSERT_COUNT = 1000
 
-KEY_SEQ_RANGE = 100000000
-DEFAULT_TIMESTAMP = 1400000000
-VALUES_PER_KEY= 100
+IGNORE_CMDS = (
+    'PSYNC', 'REPLCONF', 'COMMAND',
+    'SLOWLOG', 'CLUSTER', 'INFO',
+    'AUTH', 'PING', 'CONFIG',
+    'MONITOR', 'CLIENT', 'SLAVEOF',
+    'PUBLISH', 'SUBSCRIBE', 'UNSUBSCRIBE',
+    'PSUBSCRIBE', 'DBSIZE', 'SELECT',
+)
 
-TIME_MS = 1000
-TIME_US = 1000000
+CMD_ETC = 'ETC'
+CMD_TOTAL = 'TOTAL'
 
 
-def set_hashval(r, k, vc):
-    '''
-    === hash mode=== 
-    key: STR
-    values: { audience_group_id(field): timestamp(value) }
-    example:
-      key: ebb6523878aa9907523700000000000000018553
-      values: {'119305335': '1400000036', ... '100224834': '1400000071'}
-    '''
-    v = { '{}'.format(randrange(1,KEY_SEQ_RANGE) + KEY_SEQ_RANGE) : DEFAULT_TIMESTAMP + n for n in xrange(vc) }
-    return save_to_redis(r.hmset, k, v)
+class LoopHandler(object):
+    SIGNAL = False
 
-def set_strval(r, k, vc):
-    '''
-    === string mode=== 
-    key: STR
-    values: [{ id: #####, timestamp: #####}, ...  }
-    example
-      key: ebb6523878aa9907523700000000000000018553
-      values: "[{'timestamp': 1400000000, 'id': 180069208}, ... ,{'timestamp': 1400000001, 'id': 128858566}]"
-    '''
-    v = str([ dict({'id': randrange(1,KEY_SEQ_RANGE)+KEY_SEQ_RANGE, 'timestamp': DEFAULT_TIMESTAMP + n}) for n in xrange(vc) ])
-    return save_to_redis(r.set, k, v)
 
-def save_to_redis(f, k, v):
-    start_time = time()
-    f(k,v)
-    return time() - start_time
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_cmd_stats_closure(host, port, password, cmd, ignore_cmd):
+    r = StrictRedis(host, port, password=password)
+
+    def extract_key_value(key_value):
+        (k, v) = key_value
+        return (k.replace('cmdstat_', '').upper(), v['calls'])
+
+    def is_command(k):
+        return k in cmd or (k not in ignore_cmd and cmd == [])
+
+    def stats_summary(stats, key_value):
+        (k, v) = key_value
+        if is_command(k):
+            stats[k] = v
+        else:
+            stats[CMD_ETC] = stats[CMD_ETC] + v
+
+        stats[CMD_TOTAL] = stats[CMD_TOTAL] + v
+
+        return stats
+
+    def get_cmd_stats():
+        stats = {}
+        try:
+            stats_raw = dict(map(extract_key_value, r.info('commandstats').items()))
+            stats = reduce(stats_summary, stats_raw.items(), {CMD_ETC:0, CMD_TOTAL: 0})
+        except RedisError as e:
+            raise e
+        except KeyboardInterrupt as e:
+            pass
+
+        return stats
+
+    return get_cmd_stats
+
+
+def get_cluster_master_nodes(host, port):
+    nodes = []
+    try:
+        r = StrictRedis(host=host, port=port)
+        nodes = [k.split(':') for k, v in sorted(r.cluster('nodes').items(), key=itemgetter(0))
+                 if v['flags'] in ('master', 'myself,master')]
+    except RedisError as e:
+        print('Redis Error: ', e)
+    finally:
+        del r
+
+    return nodes
+
+
+def signal_handler(signal, frame):
+    LoopHandler.SIGNAL = True
+
+
+def main(nodes, password, cmd, ignore_cmd):
+
+    signal(SIGINT, signal_handler)
+
+    # RedisConn = namedtuple('RedisConn', 'host port r')
+    # redis_conns = []
+    redis_stats_funcs = []
+
+    try:
+        for i, node in enumerate(nodes):
+            (host, port) = node
+            redis_stats_funcs.append(get_cmd_stats_closure(host, port, password, cmd, ignore_cmd))
+
+        pre_stats = defaultdict(lambda: 0)
+
+        while True:
+            if LoopHandler.SIGNAL:
+                break
+
+            success = 0
+
+            temp_stats = defaultdict(lambda: 0)
+            stats = defaultdict(lambda: 0)
+
+            executor = ThreadPoolExecutor(max_workers=8)
+            threads = map(executor.submit, redis_stats_funcs)
+
+            for t in as_completed(threads):
+                if not t.result() == {}:
+                    success = success + 1
+
+                for k, v in t.result().items():
+                    temp_stats[k] = temp_stats[k] + v
+
+            for k, v in temp_stats.items():
+                stats[k] = v - pre_stats[k] if pre_stats[k] != 0 else 0
+                pre_stats[k] = v
+
+            print_data = ['{0}={1}'.format(*v) for v in sorted(stats.items(), key=itemgetter(0))
+                          if v[0] not in (CMD_ETC, CMD_TOTAL)]
+
+            print_data.append('{0}={1}'.format(CMD_ETC, stats[CMD_ETC]))
+            print_data.append('{0}={1}'.format(CMD_TOTAL, stats[CMD_TOTAL]))
+
+            print_string = ', '.join(print_data)
+
+            print('[{now}] ({success}) {values}'.format(now=now(), success=success, values=print_string))
+            sleep(1)
+
+    except KeyboardInterrupt as e:
+        pass
+
+    except RedisError as e:
+        print('RedisError:', e)
+
 
 if __name__ == '__main__':
-    parser = ArgumentParser()
-    parser.add_argument('-s', '--seed', type=int, default=1
-        , help='seed value for key sequence')
-    parser.add_argument('-m', '--mode', required=True, type=str, default='hash', choices=['str', 'hash', 'hashlong']
-        , help='select test mode')
-    parser.add_argument('-l', '--vals', type=int, default=VALUES_PER_KEY
-        , help='Number of group id per audience id')
-    parser.add_argument('-c', '--counts', type=int, default=DEFAULT_INSERT_COUNT
-        , help='Number of executions. It is also the number of keys')
+    description = '''Description:
+    This is tool that prints OPS for each redis command.
+    The output is just a single line that is a summary of the servers specified in the host-port option.
+    '''
+    usage = '''
+    redis_cmd_stats.py --host-port=<HOST>:<PORT> ... --host-port=<HOST>:<PORT> --command=GET,SET,DEL
+    '''
+    parser = ArgumentParser(description=description, usage=usage)
+
+    parser.add_argument("--host-port", action='append', type=str, required=True,
+                        help='''Specify the server you want to monitor in the format '<HOST>:<PORT>'.
+                        To monitor multiple servers, this can be specified multiple times.'''
+                        )
+
+    parser.add_argument("--cluster", action='store_true', default=False,
+                        help='''Options for redis cluster.
+                                You can specify this option
+                                if you want to monitor the entire master node of the redis cluster.
+                                You can specify only one host option, because the connection
+                                information for the entire master node is obtained
+                                by the 'cluster nodes' command.
+                                '''
+                        )
+
+    parser.add_argument("--commands", action='store', type=str, default='',
+                        help='''Specify the command you want to monitor.
+                                If you use this option, ignore_command is ignored.'''
+                        )
+
+    parser.add_argument("--ignore-commands", action='store', type=str, default=','.join(IGNORE_CMDS),
+                        help='''Specify the command you want to monitor.
+                                If you use this option, default ignore commands are ignored.
+                                Default: {0}'''.format(','.join(IGNORE_CMDS))
+                        )
+
+    parser.add_argument("--password", action='store', type=str,
+                        help='''Password to use when connecting to redis.'''
+                        )
 
     options = parser.parse_args()
 
-    seed = options.seed
-    insert_count = options.counts
-    values_per_key = options.vals
+    nodes = [s.split(':') for s in list(options.host_port)]
 
-    start = (insert_count * seed) + 1
-    end   = (insert_count * seed) + insert_count + 1
-    unit_of_time = TIME_MS
-    
+    if options.cluster:
+        (host, port) = nodes[0]
+        nodes = get_cluster_master_nodes(host, port)
 
-    r = StrictRedis(host='music-ddl-test001-dbteamtest-jp2p-prod.lineinfra.com', port=7000, db=0)
-    r.flushall()
-    init_memory = r.info('Memory')['used_memory']
-    
-    f_setval = set_hashval
-   
-    if options.mode == 'str':
-        f_setval = set_strval
-    elif options.mode == 'hashlong':
-        r.config_set('hash-max-ziplist-entries', 10)
-    else:
-        r.config_set('hash-max-ziplist-entries', 1024)
-   
-    print f_setval.__doc__
-    
-    result = []
-    for i in xrange(start, end):
-        k = '{:.20}{:020}'.format(md5(str(random())).hexdigest(), i)
-        result.append(f_setval(r, k, values_per_key) * unit_of_time)
-   
-    used_memory = r.info('Memory')['used_memory'] - init_memory
-    mem_per_key = used_memory / insert_count
-    resp_avg = sum(result) / float(len(result))
-    resp_min = min(result)
-    resp_max = max(result)
-    resp_total = sum(result)
+    cmd = [c.strip().upper() for c in options.commands.strip().split(',') if c != '']
+    ignore_cmd = [c.strip().upper() for c in options.ignore_commands.strip().split(',') if c != '']
 
-    print '''
-    -----------------------
-    *** result
-    keys/values per key: {}/{}
-    used_memory: {} kb
-    mem per key: {} bytes
-    avg: {:.3f} ms, min: {:.3f} ms, max: {:.3f} ms, total: {:.3f} ms
-    '''.format(insert_count, values_per_key, used_memory, mem_per_key
-    , resp_avg, resp_min, resp_max, resp_max)
+    if nodes != []:
+        print('-----------------------------------')
+        print('* Servers:')
+        for node in nodes:
+            print('    {0}:{1}'.format(*node))
+
+        print()
+        print('* Number of Servers: {0}'.format(len(nodes)))
+        print('* Cluster : {0}'.format(options.cluster))
+        print('* Command: {0}'.format(', '.join(cmd)))
+        print('* Ignore Command: {0}'.format(', '.join(ignore_cmd)))
+        print('-----------------------------------')
+
+        main(nodes, options.password, cmd, ignore_cmd)
